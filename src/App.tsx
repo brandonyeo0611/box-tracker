@@ -1,9 +1,6 @@
-import { useState, useEffect, useCallback } from "react";
-import { scan } from "./stateMachine";
+import { useState, useEffect, useRef } from "react";
 import type { Box, BoxState } from "./stateMachine";
 import { isNFCSupported, startScan } from "./scanner";
-
-// ─── constants ───────────────────────────────────────────────────────────────
 
 const BLOOD_BANK = "Blood Bank";
 
@@ -25,54 +22,6 @@ function locationLabel(loc: string): string {
   return ward ? `Level ${ward.level} · ${ward.name}` : loc;
 }
 
-function seedBoxes(): Box[] {
-  return Array.from({ length: 10 }, (_, i) => ({
-    id: `BOX-${String(i + 1).padStart(2, "0")}`,
-    state: "AT_BLOOD_BANK" as BoxState,
-    location: BLOOD_BANK,
-    deliveredAt: null,
-  }));
-}
-
-// ─── localStorage helpers ────────────────────────────────────────────────────
-
-function loadBoxes(): Box[] {
-  try {
-    const raw = localStorage.getItem("boxes");
-    if (raw) return JSON.parse(raw) as Box[];
-  } catch (_) { /* ignore */ }
-  return seedBoxes();
-}
-
-function saveBoxes(boxes: Box[]) {
-  try { localStorage.setItem("boxes", JSON.stringify(boxes)); } catch (_) { /* ignore */ }
-}
-
-function loadTagMap(): Record<string, string> {
-  try {
-    const raw = localStorage.getItem("tagMap");
-    if (raw) return JSON.parse(raw) as Record<string, string>;
-  } catch (_) { /* ignore */ }
-  return {};
-}
-
-function saveTagMap(m: Record<string, string>) {
-  try { localStorage.setItem("tagMap", JSON.stringify(m)); } catch (_) { /* ignore */ }
-}
-
-function loadLocation(): string {
-  try {
-    const v = localStorage.getItem("location");
-    if (v && ALL_LOCATIONS.includes(v)) return v;
-  } catch (_) { /* ignore */ }
-  return BLOOD_BANK;
-}
-
-function saveLocation(loc: string) {
-  try { localStorage.setItem("location", loc); } catch (_) { /* ignore */ }
-}
-
-// ─── time formatting ─────────────────────────────────────────────────────────
 
 function formatAge(ms: number): string {
   if (ms < 0) ms = 0;
@@ -87,106 +36,111 @@ function stateLabel(s: BoxState): string {
   switch (s) {
     case "AT_BLOOD_BANK": return "At Blood Bank";
     case "AT_WARD": return "At Ward";
-    case "IN_TRANSIT_BACK": return "In Transit";
   }
 }
 
-// ─── App ─────────────────────────────────────────────────────────────────────
+
+async function request<T>(path: string, body?: unknown): Promise<T> {
+  const response = await fetch(`/api/${path}`, body === undefined
+    ? { cache: "no-store", signal: AbortSignal.timeout(5000) }
+    : { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(5000) });
+  const data = await response.json();
+  if (!response.ok) throw new Error(data.error || "Unable to reach the shared server.");
+  return data;
+}
+const errorMessage = (error: unknown) => error instanceof Error ? error.message : "Unable to save. Try again.";
 
 export default function App() {
-  const [boxes, setBoxes] = useState<Box[]>(loadBoxes);
-  const [tagMap, setTagMap] = useState<Record<string, string>>(loadTagMap);
-  const [location, setLocation] = useState<string>(loadLocation);
+  const checkpoint = new URLSearchParams(window.location.search).get("view") === "checkpoint";
+  const [boxes, setBoxes] = useState<Box[]>([]);
+  const [connected, setConnected] = useState(false);
+  const [location, setLocation] = useState(() => {
+    try { const saved = localStorage.getItem("location") || localStorage.getItem("checkpointLocation"); return saved && ALL_LOCATIONS.includes(saved) ? saved : BLOOD_BANK; }
+    catch { return BLOOD_BANK; }
+  });
   const [result, setResult] = useState<{ ok: boolean; message: string } | null>(null);
-  const [, setNow] = useState(Date.now());
-
   const [allOpen, setAllOpen] = useState(false);
   const [expandedWard, setExpandedWard] = useState<string | null>(null);
   const [filterState, setFilterState] = useState<BoxState | "">("");
   const [filterLocation, setFilterLocation] = useState("");
   const [simOpen, setSimOpen] = useState(false);
   const [simBoxId, setSimBoxId] = useState("BOX-01");
-
-  const nfcAvailable = isNFCSupported();
   const [pendingSerial, setPendingSerial] = useState<string | null>(null);
   const [pendingBoxId, setPendingBoxId] = useState("BOX-01");
   const [scanning, setScanning] = useState(false);
-  const [nfcError, setNfcError] = useState(false);
+  const [starting, setStarting] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const nfcAvailable = isNFCSupported();
+  const session = useRef<AbortController | null>(null);
+  const inFlight = useRef(false);
+  const lastRead = useRef({ tag: "", at: 0 });
 
   useEffect(() => {
-    const id = setInterval(() => setNow(Date.now()), 60000);
-    return () => clearInterval(id);
+    let active = true;
+    let timer: ReturnType<typeof setTimeout>;
+    const poll = async () => {
+      try {
+        const data = await request<Box[]>("boxes");
+        if (active) { setBoxes(data); setConnected(true); }
+      } catch { if (active) setConnected(false); }
+      finally { if (active) timer = setTimeout(poll, 1500); }
+    };
+    void poll();
+    return () => { active = false; clearTimeout(timer); session.current?.abort(); };
   }, []);
+  useEffect(() => { try { localStorage.setItem("location", location); } catch { /* Keep the selection for this session. */ } }, [location]);
 
-  useEffect(() => { saveBoxes(boxes); }, [boxes]);
-  useEffect(() => { saveTagMap(tagMap); }, [tagMap]);
-  useEffect(() => { saveLocation(location); }, [location]);
-
-  const applyBoxScan = useCallback(
-    (boxId: string) => {
-      setBoxes((prev) => {
-        const box = prev.find((b) => b.id === boxId);
-        if (!box) {
-          setResult({ ok: false, message: `Unknown box: ${boxId}` });
-          return prev;
-        }
-        const res = scan(box, location, Date.now());
-        setResult({ ok: res.ok, message: res.message });
-        return prev.map((b) => (b.id === boxId ? res.box : b));
-      });
-    },
-    [location]
-  );
-
+  const stop = () => { session.current?.abort(); session.current = null; setScanning(false); setStarting(false); };
+  const applyBoxScan = async (identity: { tag: string } | { boxId: string }) => {
+    if (inFlight.current) return;
+    inFlight.current = true; setBusy(true);
+    try {
+      const saved = await request<{ message: string }>("scans", { ...identity, location });
+      setResult({ ok: true, message: saved.message });
+    } catch (error) {
+      const message = errorMessage(error);
+      setResult({ ok: false, message });
+      if ("tag" in identity && message.startsWith("Unknown tag.")) {
+        stop(); setPendingSerial(identity.tag); setPendingBoxId("BOX-01");
+      }
+    } finally { inFlight.current = false; setBusy(false); }
+  };
   const handleScanButton = async () => {
-    if (!nfcAvailable) return;
-    setScanning(true);
+    if (session.current) { stop(); return; }
+    const controller = new AbortController(); session.current = controller;
+    setStarting(true); setResult(null); setPendingSerial(null); lastRead.current = { tag: "", at: 0 };
     try {
-      await startScan((serial) => {
-        setScanning(false);
-        const mapped = tagMap[serial];
-        if (mapped) {
-          applyBoxScan(mapped);
-        } else {
-          setPendingSerial(serial);
-          setPendingBoxId("BOX-01");
-        }
-      });
-    } catch (_) {
-      setScanning(false);
-      setNfcError(true);
-    }
+      await startScan(tag => {
+        if (controller.signal.aborted || inFlight.current) return;
+        const now = Date.now();
+        if (lastRead.current.tag === tag && now - lastRead.current.at < 2000) return;
+        lastRead.current = { tag, at: now };
+        void applyBoxScan({ tag });
+      }, message => setResult({ ok: false, message }), controller.signal);
+      if (!controller.signal.aborted) setScanning(true);
+    } catch (error) {
+      if (!controller.signal.aborted) { session.current = null; setResult({ ok: false, message: errorMessage(error) }); }
+    } finally { if (session.current === controller) setStarting(false); }
   };
-
-  const confirmTagMapping = () => {
-    if (!pendingSerial) return;
-    const updated = { ...tagMap, [pendingSerial]: pendingBoxId };
-    setTagMap(updated);
-    applyBoxScan(pendingBoxId);
-    setPendingSerial(null);
-  };
-
-  const handleSimulate = () => {
-    applyBoxScan(simBoxId);
-  };
-
-  const handleReset = () => {
-    const fresh = seedBoxes();
-    setBoxes(fresh);
-    setResult(null);
-    setTagMap({});
-    setPendingSerial(null);
-    setLocation(BLOOD_BANK);
-    setFilterState("");
-    setFilterLocation("");
-    setAllOpen(false);
-    setSimOpen(false);
-    setExpandedWard(null);
+  const confirmTagMapping = async () => {
+    if (!pendingSerial || inFlight.current) return;
+    setBusy(true);
     try {
-      localStorage.removeItem("boxes");
-      localStorage.removeItem("tagMap");
-      localStorage.removeItem("location");
-    } catch (_) { /* ignore */ }
+      await request("tags", { tag: pendingSerial, boxId: pendingBoxId });
+      setPendingSerial(null);
+      await applyBoxScan({ boxId: pendingBoxId });
+    } catch (error) { setResult({ ok: false, message: errorMessage(error) }); }
+    finally { setBusy(false); }
+  };
+  const handleSimulate = () => { void applyBoxScan({ boxId: simBoxId }); };
+  const handleReset = async () => {
+    if (!window.confirm("Reset all shared demo boxes and tag mappings?")) return;
+    stop(); setBusy(true);
+    try {
+      await request("reset", {}); setPendingSerial(null); setLocation(BLOOD_BANK);
+      setResult({ ok: true, message: "Demo boxes and tags reset." });
+    } catch (error) { setResult({ ok: false, message: errorMessage(error) }); }
+    finally { setBusy(false); }
   };
 
   // round list
@@ -209,6 +163,7 @@ export default function App() {
       </header>
 
       <main style={S.main}>
+        {checkpoint && <>
         {/* 1. Location */}
         <section style={S.card}>
           <label htmlFor="location-select" style={S.label}>
@@ -217,7 +172,8 @@ export default function App() {
           <select
             id="location-select"
             value={location}
-            onChange={(e) => setLocation(e.target.value)}
+            disabled={scanning || starting || busy}
+            onChange={(e) => { setLocation(e.target.value); setResult(null); }}
             style={S.select}
           >
             <option value={BLOOD_BANK}>{BLOOD_BANK}</option>
@@ -231,16 +187,16 @@ export default function App() {
 
         {/* 2. Scan */}
         <section style={S.card}>
-          {nfcAvailable && !nfcError ? (
+          {nfcAvailable ? (
             <button
               style={{ ...S.scanBtn, opacity: scanning ? 0.6 : 1 }}
               onClick={handleScanButton}
-              disabled={scanning}
+              disabled={busy || (!connected && !scanning && !starting)}
             >
-              {scanning ? "Scanning…" : "Scan box"}
+              {starting ? "Cancel starting" : scanning ? "Stop scanning" : "Scan box"}
             </button>
           ) : (
-            <p style={S.nfcNote}>NFC not supported. Use Simulate below.</p>
+            <p style={S.nfcNote}>NFC unavailable. Use HTTPS on a compatible NFC phone, or Simulate below.</p>
           )}
 
           {pendingSerial && (
@@ -251,6 +207,7 @@ export default function App() {
               <div style={S.row}>
                 <select
                   value={pendingBoxId}
+                  disabled={busy}
                   onChange={(e) => setPendingBoxId(e.target.value)}
                   style={{ ...S.select, flex: 1 }}
                 >
@@ -258,7 +215,7 @@ export default function App() {
                     <option key={b.id} value={b.id}>{b.id}</option>
                   ))}
                 </select>
-                <button style={S.confirmBtn} onClick={confirmTagMapping}>
+                <button style={S.confirmBtn} disabled={busy || !connected} onClick={() => void confirmTagMapping()}>
                   Confirm
                 </button>
               </div>
@@ -272,6 +229,8 @@ export default function App() {
           )}
         </section>
 
+        </>}
+        {!checkpoint && <>
         {/* 3. Round list */}
         <section style={S.card}>
           <h2 style={S.sectionTitle}>Empty boxes waiting</h2>
@@ -383,6 +342,8 @@ export default function App() {
           })()}
         </section>
 
+        </>}
+        {checkpoint && <>
         {/* 5. Simulate */}
         <section style={S.card}>
           <button style={S.collapseBtn} onClick={() => setSimOpen((v) => !v)}>
@@ -402,19 +363,20 @@ export default function App() {
                     <option key={b.id} value={b.id}>{b.id}</option>
                   ))}
                 </select>
-                <button style={S.confirmBtn} onClick={handleSimulate}>
+                <button style={S.confirmBtn} disabled={busy || !connected || scanning || starting} onClick={handleSimulate}>
                   Scan
                 </button>
               </div>
             </div>
           )}
         </section>
+        </>}
+        {!connected && <p style={S.nfcNote} role="status">Not connected. Check the server; displayed locations may be out of date.</p>}
       </main>
 
       <footer style={S.footer}>
-        <button style={S.resetBtn} onClick={handleReset}>
-          Reset everything
-        </button>
+        {checkpoint && <button style={S.resetBtn} disabled={busy || !connected} onClick={() => void handleReset()}>Reset everything</button>}
+        <p><a style={{ color: BLUE, fontSize: "0.85rem" }} href={checkpoint ? "/" : "/?view=checkpoint"} onClick={stop}>{checkpoint ? "View tracking" : "Reader interface"}</a></p>
       </footer>
     </div>
   );

@@ -4,11 +4,13 @@
   "version": "0.0.0",
   "type": "module",
   "scripts": {
-    "dev": "vite",
+    "dev": "node server/index.ts --dev",
     "build": "tsc -b && vite build",
     "lint": "oxlint",
-    "preview": "vite preview",
-    "test": "vitest run"
+    "preview": "node server/index.ts",
+    "test": "vitest run",
+    "start": "node server/index.ts",
+    "test:http": "node server/smoke.mjs"
   },
   "dependencies": {
     "react": "^19.3.1",
@@ -23,5 +25,8 @@
     "typescript": "~7.0.2",
     "vite": "^8.3.5",
     "vitest": "^5.0.5"
+  },
+  "engines": {
+    "node": ">=24.0.0"
   }
 }
