@@ -1,4 +1,5 @@
 import { useState, useEffect, useRef } from "react";
+import { waitingWards } from "./collectionList";
 import type { Box, BoxState } from "./stateMachine";
 import { isNFCSupported, startScan } from "./scanner";
 
@@ -34,8 +35,8 @@ function formatAge(ms: number): string {
 
 function stateLabel(s: BoxState): string {
   switch (s) {
-    case "AT_BLOOD_BANK": return "At Blood Bank";
-    case "AT_WARD": return "At Ward";
+    case "AT_BLOOD_BANK": return "Retrieved";
+    case "AT_WARD": return "Awaiting retrieval";
   }
 }
 
@@ -54,6 +55,7 @@ export default function App() {
   const checkpoint = new URLSearchParams(window.location.search).get("view") === "checkpoint";
   const [boxes, setBoxes] = useState<Box[]>([]);
   const [connected, setConnected] = useState(false);
+  const [now, setNow] = useState(Date.now);
   const [location, setLocation] = useState(() => {
     try { const saved = localStorage.getItem("location") || localStorage.getItem("checkpointLocation"); return saved && ALL_LOCATIONS.includes(saved) ? saved : BLOOD_BANK; }
     catch { return BLOOD_BANK; }
@@ -81,7 +83,7 @@ export default function App() {
     const poll = async () => {
       try {
         const data = await request<Box[]>("boxes");
-        if (active) { setBoxes(data); setConnected(true); }
+        if (active) { setBoxes(data); setConnected(true); setNow(Date.now()); }
       } catch { if (active) setConnected(false); }
       finally { if (active) timer = setTimeout(poll, 1500); }
     };
@@ -143,18 +145,7 @@ export default function App() {
     finally { setBusy(false); }
   };
 
-  // round list
-  const wardBoxes = boxes.filter((b) => b.state === "AT_WARD");
-  const roundMap = new Map<number, Map<string, Box[]>>();
-  for (const b of wardBoxes) {
-    const lvl = levelOf(b.location);
-    if (lvl === null) continue;
-    if (!roundMap.has(lvl)) roundMap.set(lvl, new Map());
-    const wardMap = roundMap.get(lvl)!;
-    if (!wardMap.has(b.location)) wardMap.set(b.location, []);
-    wardMap.get(b.location)!.push(b);
-  }
-  const sortedLevels = Array.from(roundMap.keys()).sort((a, b) => a - b);
+  const sortedWards = waitingWards(boxes);
 
   return (
     <div style={S.page}>
@@ -234,48 +225,30 @@ export default function App() {
         {/* 3. Round list */}
         <section style={S.card}>
           <h2 style={S.sectionTitle}>Empty boxes waiting</h2>
-          {sortedLevels.length === 0 ? (
+          {sortedWards.length === 0 ? (
             <p style={S.emptyState}>No empty boxes waiting.</p>
-          ) : (
-            sortedLevels.map((lvl) => {
-              const wardMap = roundMap.get(lvl)!;
-              return (
-                <div key={lvl}>
-                  <p style={S.levelHeading}>Level {lvl}</p>
-                  {Array.from(wardMap.entries()).map(([ward, bxs]) => {
-                    const oldest = bxs.reduce(
-                      (min, b) => (b.deliveredAt !== null && b.deliveredAt < min ? b.deliveredAt : min),
-                      Infinity
-                    );
-                    const age = oldest < Infinity ? formatAge(Date.now() - oldest) : "—";
-                    const count = bxs.length;
-                    const isOpen = expandedWard === ward;
-                    return (
-                      <div key={ward}>
-                        <button
-                          style={S.wardRowBtn}
-                          onClick={() => setExpandedWard(isOpen ? null : ward)}
-                        >
-                          <span style={S.wardName}>{ward}</span>
-                          <span style={S.wardDetail}>
-                            {count} empty {count === 1 ? "box" : "boxes"} · oldest {age}
-                            <span style={S.chevron}>{isOpen ? " ▾" : " ▸"}</span>
-                          </span>
-                        </button>
-                        {isOpen && (
-                          <div style={S.boxChips}>
-                            {bxs.map((b) => (
-                              <span key={b.id} style={S.chip}>{b.id}</span>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                    );
-                  })}
-                </div>
-              );
-            })
-          )}
+          ) : sortedWards.map(({ ward, boxes: bxs, oldest }) => {
+            const age = oldest < Infinity ? formatAge(now - oldest) : "—";
+            const count = bxs.length;
+            const isOpen = expandedWard === ward;
+            return (
+              <div key={ward}>
+                <p style={S.levelHeading}>Level {levelOf(ward)}</p>
+                <button style={S.wardRowBtn} onClick={() => setExpandedWard(isOpen ? null : ward)}>
+                  <span style={S.wardName}>{ward}</span>
+                  <span style={S.wardDetail}>
+                    {count} empty {count === 1 ? "box" : "boxes"} · oldest {age}
+                    <span style={S.chevron}>{isOpen ? " ▾" : " ▸"}</span>
+                  </span>
+                </button>
+                {isOpen && (
+                  <div style={S.boxChips}>
+                    {bxs.map(b => <span key={b.id} style={S.chip}>{b.id}</span>)}
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </section>
 
         {/* 4. All boxes */}
@@ -299,9 +272,8 @@ export default function App() {
                     style={{ ...S.select, flex: 1, height: "36px", fontSize: "0.85rem" }}
                   >
                     <option value="">All states</option>
-                    <option value="AT_BLOOD_BANK">At Blood Bank</option>
-                    <option value="AT_WARD">At Ward</option>
-                    <option value="IN_TRANSIT_BACK">In Transit</option>
+                    <option value="AT_BLOOD_BANK">Retrieved</option>
+                    <option value="AT_WARD">Awaiting retrieval</option>
                   </select>
                   <select
                     aria-label="Filter by location"
@@ -330,7 +302,7 @@ export default function App() {
                       filtered.map((b) => (
                         <tr key={b.id}>
                           <td style={S.td}>{b.id}</td>
-                          <td style={S.td}>{stateLabel(b.state)}</td>
+                          <td style={{ ...S.td, color: b.state === "AT_BLOOD_BANK" ? "#0a7d52" : "#b42318" }}>{stateLabel(b.state)}</td>
                           <td style={S.td}>{locationLabel(b.location)}</td>
                         </tr>
                       ))
